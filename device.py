@@ -1,87 +1,92 @@
 # ================================================================
-#  device.py — подключение к ANTSDR E200 и замеры через libiio
-#  Фиксы: BW = SR, диапазон 70MHz-6GHz
+#  device.py — RTL-SDR через pyrtlsdr
 # ================================================================
 
-import iio
 import numpy as np
 import time
+from rtlsdr import RtlSdr
 
-from config import URI, FFT_SIZE, BUFFER_SIZE, MEASURE_PER_FREQ
-from config import THRESHOLD_DB, BINS_ABOVE_MIN, CONFIRM_REQUIRED
+from config import (RTL_DEVICE_INDEX, RTL_FREQ_MIN, RTL_FREQ_MAX,
+                    FFT_SIZE, BUFFER_SIZE, MEASURE_PER_FREQ,
+                    THRESHOLD_DB, BINS_ABOVE_MIN, FFT_AVG)
 
 
 class Device:
     def __init__(self):
-        self.ctx   = None
-        self.lo    = None
-        self.buf   = None
+        self.sdr   = None
         self._freq = None
 
     def connect(self, profile: dict):
-        print(f"[*] Подключение к {URI}...")
-        self.ctx = iio.Context(URI)
+        print(f"[*] Открываем RTL-SDR (индекс {RTL_DEVICE_INDEX})...")
 
-        rx  = self.ctx.find_device("cf-ad9361-lpc")
-        phy = self.ctx.find_device("ad9361-phy")
-
-        rx_chan = rx.find_channel("voltage0", False)
-        rx_chan.enabled = True
-
-        # Sample rate + BW для обоих каналов (I и Q)
-        for ch_name in ["voltage0", "voltage1"]:
-            ch = phy.find_channel(ch_name, False)
-            if ch:
-                try:
-                    ch.attrs["sampling_frequency"].value = str(int(profile["sample_rate"]))
-                except Exception as e:
-                    print(f"[!] sampling_frequency ch {ch_name}: {e}")
-                try:
-                    # BW должен быть равен SR — иначе фильтр режет полосу
-                    ch.attrs["rf_bandwidth"].value = str(int(profile["sample_rate"]))
-                except Exception as e:
-                    print(f"[!] rf_bandwidth ch {ch_name}: {e}")
-
-        # Gain — manual, отключаем AGC
         try:
-            ch = phy.find_channel("voltage0", False)
-            ch.attrs["gain_control_mode"].value = "manual"
-            ch.attrs["hardwaregain"].value = str(profile["gain"])
-            actual_gain = ch.attrs["hardwaregain"].value
+            self.sdr = RtlSdr(RTL_DEVICE_INDEX)
         except Exception as e:
-            actual_gain = "?"
-            print(f"[!] Gain не установлен: {e}")
+            print(f"[!] Не удалось открыть RTL-SDR: {e}")
+            print("[!] Проверь подключение и права (возможно нужен udev rule или sudo)")
+            exit(1)
 
-        self.lo  = phy.find_channel("altvoltage0", True)
-        self.buf = iio.Buffer(rx, BUFFER_SIZE, False)
+        # Ограничиваем частоты диапазоном тюнера
+        start = max(profile["start"], RTL_FREQ_MIN)
+        stop  = min(profile["stop"],  RTL_FREQ_MAX)
+        if start > stop:
+            print(f"[!] Диапазон {profile['start']/1e6:.0f}-{profile['stop']/1e6:.0f} МГц "
+                  f"выходит за пределы RTL-SDR ({RTL_FREQ_MIN/1e6:.0f}-{RTL_FREQ_MAX/1e6:.0f} МГц)")
+            exit(1)
+        profile["start"] = start
+        profile["stop"]  = stop
 
-        # Читаем реальный диапазон с устройства
-        try:
-            freq_range = self.lo.attrs["frequency_available"].value
-        except Exception:
-            freq_range = "70MHz-6GHz"
+        # Sample rate — RTL-SDR поддерживает 225-300 кГц или 900 кГц - 3.2 МГц
+        # Диапазон 300-900 кГц нестабилен — избегаем
+        sr = profile["sample_rate"]
+        if 300e3 < sr < 900e3:
+            sr = 2.048e6
+            print(f"[!] Sample rate скорректирован до {sr/1e6:.3f} МГц (300-900 кГц нестабильны)")
+            profile["sample_rate"] = sr
 
-        print(f"[+] Подключено")
-        print(f"    SR:    {profile['sample_rate']/1e6:.1f} МГц")
-        print(f"    BW:    {profile['sample_rate']/1e6:.1f} МГц  (= SR, полная полоса)")
-        print(f"    Gain:  {actual_gain} dB")
-        print(f"    Диапазон устройства: {freq_range}")
+        self.sdr.sample_rate = sr
+        self.sdr.center_freq = int(profile["start"])
 
-    def tune(self, freq_hz: float, settle_s: float = 0.08):
-        """Перестроить LO. Ограничиваем частоту диапазоном AD9361."""
-        freq_hz = max(70e6, min(6000e6, freq_hz))
+        # Gain — 0 = AGC, >0 = manual
+        if profile["gain"] == 0:
+            self.sdr.gain = "auto"
+            actual_gain = "auto (AGC)"
+        else:
+            self.sdr.gain = profile["gain"]
+            actual_gain = f"{self.sdr.gain} dB"
+
+        # Коррекция частоты (ppm) — можно подтюнить под конкретный донгл
+        self.sdr.freq_correction = 0
+
+        print(f"[+] RTL-SDR подключён")
+        print(f"    Тюнер:   {self.sdr.get_tuner_type()}")
+        print(f"    SR:      {self.sdr.sample_rate/1e6:.3f} МГц")
+        print(f"    Gain:    {actual_gain}")
+        print(f"    Диапазон: {profile['start']/1e6:.1f} – {profile['stop']/1e6:.1f} МГц")
+        print(f"    FFT avg: {FFT_AVG} кадров")
+
+    def tune(self, freq_hz: float):
+        freq_hz = max(RTL_FREQ_MIN, min(RTL_FREQ_MAX, freq_hz))
         if self._freq != freq_hz:
-            self.lo.attrs["frequency"].value = str(int(freq_hz))
-            time.sleep(settle_s)
+            self.sdr.center_freq = int(freq_hz)
+            time.sleep(0.05)   # RTL-SDR перестраивается быстрее чем AD9361
             self._freq = freq_hz
 
     def get_spectrum(self) -> np.ndarray:
-        """Одиночный FFT-срез, возвращает мощность в dBFS."""
-        self.buf.refill()
-        raw = np.frombuffer(self.buf.read(), dtype=np.int16)
-        iq  = raw[::2].astype(np.float32) + 1j * raw[1::2].astype(np.float32)
-        fft = np.fft.fftshift(np.fft.fft(iq, FFT_SIZE))
-        return 20 * np.log10(np.abs(fft) + 1e-12)
+        """
+        Усреднённый FFT-срез по FFT_AVG кадрам.
+        Усреднение в линейной шкале (правильно математически).
+        """
+        accum = np.zeros(FFT_SIZE, dtype=np.float64)
+
+        for _ in range(FFT_AVG):
+            # RTL-SDR отдаёт complex64 напрямую
+            samples = self.sdr.read_samples(BUFFER_SIZE // 2)
+            fft = np.fft.fftshift(np.fft.fft(samples[:FFT_SIZE], FFT_SIZE))
+            accum += np.abs(fft) ** 2
+
+        avg_power = accum / FFT_AVG
+        return 10 * np.log10(avg_power + 1e-12).astype(np.float32)
 
     def measure(self, freq_hz: float):
         """
@@ -99,8 +104,8 @@ class Device:
             power = self.get_spectrum()
             last_spectrum = power
 
-            median    = np.median(power)
-            threshold = median + THRESHOLD_DB
+            median     = np.median(power)
+            threshold  = median + THRESHOLD_DB
             bins_above = int(np.sum(power > threshold))
 
             if bins_above > BINS_ABOVE_MIN:
@@ -109,10 +114,10 @@ class Device:
             powers.append(float(np.mean(power)))
 
             peak_idx = int(np.argmax(power))
-            freq_res = 20e6 / FFT_SIZE
+            freq_res = self.sdr.sample_rate / FFT_SIZE
             peak_offsets.append((peak_idx - FFT_SIZE // 2) * freq_res)
 
-            time.sleep(0.03)
+            time.sleep(0.02)
 
         avg_power = float(np.mean(powers))
         peak_freq = freq_hz + float(np.mean(peak_offsets))
@@ -120,4 +125,6 @@ class Device:
         return confirmations, avg_power, peak_freq, last_spectrum
 
     def close(self):
-        self.ctx = None
+        if self.sdr:
+            self.sdr.close()
+            self.sdr = None

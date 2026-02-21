@@ -1,64 +1,63 @@
-# ANTSDR E200 RF Scanner v4.0
-
-Модульный сканер радиочастотного спектра на базе libiio + matplotlib.
+# RTL-SDR RF Scanner v1.0
 
 ## Структура
 
 ```
-scanner/
+rtl_scanner/
 ├── main.py        — точка входа, меню
-├── config.py      — настройки, профили сканирования
-├── device.py      — подключение к E200 через libiio, замеры
-├── scanner.py     — основной цикл сканирования
-├── identify.py    — идентификация сигналов по частоте
-├── visualizer.py  — реалтайм спектр + waterfall + лог детектов
-└── rf_scans/      — CSV логи (создаётся автоматически)
+├── config.py      — настройки, профили
+├── device.py      — RTL-SDR через pyrtlsdr
+├── scanner.py     — цикл сканирования (общий с ANTSDR)
+├── identify.py    — идентификация сигналов (общий)
+├── visualizer.py  — спектр + waterfall (общий)
+└── rf_scans/      — CSV логи
 ```
 
-## Установка зависимостей
+## Установка
 
 ```bash
-pip install numpy pandas matplotlib
-# libiio и pyadi-iio — из репозитория системы или:
-sudo apt install libiio-utils python3-libiio
-```
+pip install pyrtlsdr pyqtgraph PyQt6 numpy pandas
 
-## Настройка сети
-
-E200 по умолчанию: 192.168.1.10
-
-```bash
-sudo ip addr add 192.168.1.100/24 dev eth0
-sudo ip link set eth0 up
-ping 192.168.1.10
+# Udev правило чтобы не нужен был sudo:
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0666"' \
+  | sudo tee /etc/udev/rules.d/20-rtlsdr.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+# добавь себя в группу plugdev:
+sudo usermod -aG plugdev $USER
 ```
 
 ## Запуск
 
 ```bash
-cd scanner
+cd rtl_scanner
 python3 main.py
 ```
 
-## Ключевые параметры (config.py)
+## Тюнинг (config.py)
 
 | Параметр         | По умолчанию | Описание                              |
 |------------------|--------------|---------------------------------------|
+| RTL_DEVICE_INDEX | 0            | Индекс донгла (если несколько)        |
 | THRESHOLD_DB     | 12.0         | dB над медианой для детекта           |
-| CONFIRM_REQUIRED | 2            | подтверждений из MEASURE_PER_FREQ     |
-| MEASURE_PER_FREQ | 3            | замеров на каждую частоту             |
-| BINS_ABOVE_MIN   | 3            | минимум бинов выше порога             |
+| FFT_AVG          | 4            | Усреднение FFT кадров                 |
+| CONFIRM_REQUIRED | 2            | Подтверждений для засчитывания        |
 
-### Тюнинг порога
+## Коррекция частоты (ppm)
 
-- Много ложных срабатываний → увеличь `THRESHOLD_DB` до 15–18
-- Пропускает реальные сигналы → уменьши до 8–10
-- Слишком медленно → уменьши `MEASURE_PER_FREQ` до 2
+Все RTL-SDR доноглы уплывают по частоте. Определить уход:
+```bash
+rtl_test -p
+```
+Потом в device.py:
+```python
+self.sdr.freq_correction = 51  # твоё значение ppm
+```
 
-## Горячие клавиши визуализатора
+## Диапазон по тюнерам
 
-- **Ctrl+C** в терминале — остановить сканирование и сохранить лог
-
-## Диапазон AD9361 (ANTSDR E200)
-
-70 МГц – 6 ГГц. Частоты ниже 70 МГц не поддерживаются.
+| Тюнер    | Диапазон           |
+|----------|--------------------|
+| R820T/T2 | 24 МГц – 1766 МГц  |
+| E4000    | 52 МГц – 2200 МГц  |
+| FC0013   | 22 МГц – 948 МГц   |
